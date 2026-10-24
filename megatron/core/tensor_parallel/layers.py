@@ -36,6 +36,11 @@ from megatron.core.utils import (
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
+from .fp4_simulation import (
+    fp4_linear_backward,
+    fp4_linear_forward,
+    get_fp4_simulation_mode,
+)
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -741,6 +746,45 @@ def _wgrad_gemm(out, grad_output, total_input, accumulate=False):
     return out
 
 
+class FP4SimulationLinear(torch.autograd.Function):
+    """Autograd implementation for eager NVFP4/Averis fake-quantized linear GEMMs."""
+
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx, input_tensor, weight, bias, mode, stochastic_rounding, allreduce_dgrad, tp_group
+    ):
+        ctx.save_for_backward(input_tensor, weight)
+        ctx.input_dtype = input_tensor.dtype
+        ctx.use_bias = bias is not None
+        ctx.mode = mode
+        ctx.stochastic_rounding = stochastic_rounding
+        ctx.allreduce_dgrad = allreduce_dgrad
+        ctx.tp_group = tp_group
+        return fp4_linear_forward(input_tensor, weight, bias, mode)
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        input_tensor, weight = ctx.saved_tensors
+        grad_output = grad_output.to(ctx.input_dtype)
+        grad_input, grad_weight = fp4_linear_backward(
+            input_tensor,
+            weight,
+            grad_output,
+            ctx.mode,
+            stochastic_rounding=ctx.stochastic_rounding,
+        )
+
+        if ctx.allreduce_dgrad:
+            torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+
+        grad_bias = (
+            grad_output.reshape(-1, grad_output.size(-1)).sum(dim=0) if ctx.use_bias else None
+        )
+        return grad_input, grad_weight, grad_bias, None, None, None, None
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
@@ -1065,6 +1109,45 @@ def linear_with_grad_accumulation_and_async_allreduce(
     """
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+
+    fp4_simulation_mode = get_fp4_simulation_mode()
+    if fp4_simulation_mode is not None:
+        if gradient_accumulation_fusion:
+            raise RuntimeError(
+                "FP4 fake quantization currently requires gradient accumulation fusion to be "
+                "disabled; pass --no-gradient-accumulation-fusion."
+            )
+        if grad_output_buffer is not None:
+            raise RuntimeError(
+                "FP4 fake quantization does not support deferred weight-gradient buffers."
+            )
+        if gtp_remat_size != 1:
+            raise RuntimeError(
+                "FP4 fake quantization does not support GTP weight rematerialization."
+            )
+        if output_dtype is not None:
+            raise RuntimeError(
+                "FP4 fake quantization expects the input dtype for linear outputs; "
+                "remove --fp16-lm-cross-entropy or other mixed-output settings."
+            )
+
+        if sequence_parallel:
+            input = gather_from_sequence_parallel_region(
+                input, tensor_parallel_output_grad=True, group=tp_group
+            )
+
+        stochastic_rounding = os.environ.get(
+            "MEGATRON_FP4_STOCHASTIC_ROUNDING", "1"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        return FP4SimulationLinear.apply(
+            input,
+            weight,
+            bias,
+            fp4_simulation_mode,
+            stochastic_rounding,
+            allreduce_dgrad,
+            tp_group,
+        )
 
     args = [
         input,
